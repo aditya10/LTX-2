@@ -9,13 +9,14 @@ from __future__ import annotations
 import copy
 import logging
 from collections.abc import Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from typing import Callable, TypeVar
 
 import torch
 
 from ltx_core.batch_split import BatchSplitAdapter
+from ltx_core.devices import synchronize_device
 from ltx_core.block_streaming import DISK_CPU_SLOTS, StreamingModelBuilder
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.noisers import Noiser
@@ -198,7 +199,12 @@ def _cleanup_iter(
 class DiffusionStage:
     """Owns transformer lifecycle. Builds on each call, frees on exit.
     Replaces the manual build-transformer / ``del transformer`` pattern that
-    every pipeline previously repeated.
+    every pipeline previously repeated. With ``persistent=True``, the
+    transformer is instead built once (lazily, on first call) and kept
+    resident on ``device`` -- see :meth:`release` to free it early. The same
+    cached instance transparently serves calls at different resolutions
+    (e.g. a distilled pipeline's stage 1 and stage 2), since shapes are
+    derived fresh from ``run()``'s arguments each call.
     """
 
     def __init__(
@@ -210,6 +216,7 @@ class DiffusionStage:
         quantization: QuantizationPolicy | None = None,
         compilation_config: CompilationConfig | None = None,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
+        persistent: bool = False,
     ) -> None:
         """Construct a stage from a single pre-built transformer ``builder``.
         Holds only that builder plus build-time configuration (dtype, device,
@@ -221,13 +228,21 @@ class DiffusionStage:
         ``quantization`` and ``compilation_config`` are applied lazily on the
         standard path; on the streaming path they are already baked into the
         streaming builder by :meth:`from_checkpoint` and these fields are unused.
+        ``persistent=True`` is only supported on the standard (non-streaming) path --
+        streaming/offload already keeps weights CPU-resident and streams them
+        block-by-block, so "persistent" (keep the whole model built on GPU) is not
+        meaningful there.
         """
+        if persistent and isinstance(transformer_builder, StreamingModelBuilder):
+            raise ValueError("persistent=True is not supported together with a streaming/offload transformer builder.")
         self._transformer_builder = transformer_builder
         self._dtype = dtype
         self._device = device
         self._quantization = quantization
         self._compilation_config = compilation_config
         self._alloc_trim_strategy = alloc_trim_strategy
+        self._persistent = persistent
+        self._cached_transformer: X0Model | None = None
 
     @classmethod
     def from_checkpoint(  # noqa: PLR0913
@@ -243,6 +258,7 @@ class DiffusionStage:
         offload_mode: OffloadMode = OffloadMode.NONE,
         model_configurator: type[ModelConfigurator] = LTXModelConfigurator,
         model_sd_ops: SDOps = LTXV_MODEL_COMFY_RENAMING_MAP,
+        persistent: bool = False,
     ) -> "DiffusionStage":
         """Build a stage from a checkpoint path and LoRA set.
         Constructs a single transformer builder from ``checkpoint_path`` +
@@ -292,6 +308,7 @@ class DiffusionStage:
             quantization=quantization,
             compilation_config=compilation_config,
             alloc_trim_strategy=alloc_trim_strategy,
+            persistent=persistent,
         )
 
     @staticmethod
@@ -347,15 +364,19 @@ class DiffusionStage:
         new._transformer_builder = self._transformer_builder.with_module_ops(
             (*self._transformer_builder.module_ops, op),
         )
+        new._cached_transformer = None
         return new
 
     def with_builder(self, builder: ModelBuilderProtocol[LTXModelProtocol]) -> "DiffusionStage":
         """Return a new ``DiffusionStage`` that builds its transformer from ``builder``.
         Functional: never mutates ``self``; shares all other configuration (dtype, device,
         quantization, compilation). Affects the standard (non-offload) build path.
+        Drops any cached persistent transformer -- a different builder means a
+        different model, so the copy must rebuild (and re-cache) on next call.
         """
         new = copy.copy(self)
         new._transformer_builder = builder
+        new._cached_transformer = None
         return new
 
     def with_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> "DiffusionStage":
@@ -402,6 +423,18 @@ class DiffusionStage:
             yield X0Model(streaming_wrapper).eval()
 
     def _transformer_ctx(self, **kwargs: object) -> AbstractContextManager:
+        if self._persistent:
+            if self._cached_transformer is None:
+                logger.info(
+                    "Building persistent transformer (standard) from %s", self._transformer_builder.checkpoint
+                )
+                self._cached_transformer = self._build_transformer(**kwargs)
+            return nullcontext(self._cached_transformer)
+        logger.info(
+            "Building transformer (%s) from %s",
+            "streaming" if self._is_streaming else "standard",
+            self._transformer_builder.checkpoint,
+        )
         if self._is_streaming:
             return self._streaming_transformer_ctx()
         return gpu_model(self._build_transformer(**kwargs), alloc_trim_strategy=self._alloc_trim_strategy)
@@ -412,6 +445,19 @@ class DiffusionStage:
         ``video_tools`` required by ``TiledDataParallelBuilder``).
         """
         return self._transformer_ctx(**kwargs)
+
+    def release(self) -> None:
+        """Free the cached persistent transformer, if any.
+        No-op if this stage was not constructed with ``persistent=True``, or if
+        nothing has been built yet. Safe to call and then keep using this object --
+        the next call simply rebuilds and re-caches.
+        """
+        if self._cached_transformer is None:
+            return
+        synchronize_device()
+        self._cached_transformer.to("meta")
+        self._cached_transformer = None
+        cleanup_memory()
 
     def run(  # noqa: PLR0913
         self,
@@ -509,8 +555,6 @@ class DiffusionStage:
             v_shape = VideoLatentShape.from_pixel_shape(pixel_shape)
             video_tools = VideoLatentTools(VideoLatentPatchifier(patch_size=1), v_shape, fps)
 
-        mode = "streaming" if self._is_streaming else "standard"
-        logger.info("Building transformer (%s) from %s", mode, self._transformer_builder.checkpoint)
         with self._transformer_ctx(video_tools=video_tools) as transformer:
             logger.info(
                 "Running denoising loop (%d steps, %dx%d %d frames @ %.1f fps)",
@@ -545,7 +589,9 @@ class DiffusionStage:
 class PromptEncoder:
     """Owns text encoder + embeddings processor lifecycle.
     Loads Gemma, encodes prompts, frees Gemma, then loads the embeddings
-    processor to produce final outputs.
+    processor to produce final outputs. With ``persistent=True``, both are
+    instead built once (on first call) and kept resident on ``device`` for
+    the lifetime of this object -- see :meth:`release` to free them early.
     """
 
     def __init__(
@@ -558,13 +604,20 @@ class PromptEncoder:
         offload_mode: OffloadMode = OffloadMode.NONE,
         text_encoder_builder: BuilderProtocol | None = None,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
+        persistent: bool = False,
     ) -> None:
+        if persistent and offload_mode != OffloadMode.NONE:
+            raise ValueError("persistent=True is not supported together with offload_mode != OffloadMode.NONE.")
+
         self._gemma_root = gemma_root
         self._checkpoint_path = checkpoint_path
         self._dtype = dtype
         self._device = device
         self._offload_mode = offload_mode
         self._alloc_trim_strategy = alloc_trim_strategy
+        self._persistent = persistent
+        self._cached_text_encoder: torch.nn.Module | None = None
+        self._cached_embeddings_processor: EmbeddingsProcessor | None = None
 
         if text_encoder_builder is not None:
             if offload_mode != OffloadMode.NONE:
@@ -611,11 +664,26 @@ class PromptEncoder:
         return self._embeddings_processor_builder.build(device=self._device, dtype=self._dtype).eval()
 
     def _text_encoder_ctx(self) -> AbstractContextManager:
+        if self._persistent:
+            if self._cached_text_encoder is None:
+                logger.info("Building persistent text encoder from %s", self._gemma_root)
+                self._cached_text_encoder = self._build_text_encoder()
+            return nullcontext(self._cached_text_encoder)
+        logger.info("Building text encoder from %s", self._gemma_root)
         if self._offload_mode != OffloadMode.NONE:
             return _streaming_model(
                 self._streaming_text_encoder_builder, self._device, self._dtype, self._alloc_trim_strategy
             )
         return gpu_model(self._build_text_encoder(), alloc_trim_strategy=self._alloc_trim_strategy)
+
+    def _embeddings_processor_ctx(self) -> AbstractContextManager:
+        if self._persistent:
+            if self._cached_embeddings_processor is None:
+                logger.info("Building persistent embeddings processor from %s", self._checkpoint_path)
+                self._cached_embeddings_processor = self._build_embeddings_processor()
+            return nullcontext(self._cached_embeddings_processor)
+        logger.info("Building embeddings processor from %s", self._checkpoint_path)
+        return gpu_model(self._build_embeddings_processor(), alloc_trim_strategy=self._alloc_trim_strategy)
 
     def __call__(
         self,
@@ -625,8 +693,10 @@ class PromptEncoder:
         enhance_prompt_image: str | None = None,
         enhance_prompt_seed: int = 42,
     ) -> list[EmbeddingsProcessorOutput]:
-        """Encode *prompts* through Gemma -> embeddings processor, freeing each model after use."""
-        logger.info("Building text encoder from %s", self._gemma_root)
+        """Encode *prompts* through Gemma -> embeddings processor.
+        Frees each model after use, unless this encoder was constructed with
+        ``persistent=True``, in which case both are kept resident on ``device``.
+        """
         with self._text_encoder_ctx() as text_encoder:
             if enhance_first_prompt:
                 prompts = list(prompts)
@@ -634,14 +704,28 @@ class PromptEncoder:
                     text_encoder, prompts[0], enhance_prompt_image, seed=enhance_prompt_seed
                 )
             raw_outputs = text_encoder.encode(prompts)
-        logger.info("Text encoder done, building embeddings processor from %s", self._checkpoint_path)
 
-        with gpu_model(
-            self._build_embeddings_processor(), alloc_trim_strategy=self._alloc_trim_strategy
-        ) as embeddings_processor:
+        with self._embeddings_processor_ctx() as embeddings_processor:
             result = [embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
         logger.info("Prompt encoding complete")
         return result
+
+    def release(self) -> None:
+        """Free the cached persistent text encoder / embeddings processor, if any.
+        No-op if this encoder was not constructed with ``persistent=True``, or if
+        nothing has been built yet. Safe to call and then keep using this object --
+        the next call simply rebuilds and re-caches.
+        """
+        if self._cached_text_encoder is None and self._cached_embeddings_processor is None:
+            return
+        synchronize_device()
+        if self._cached_text_encoder is not None:
+            self._cached_text_encoder.to("meta")
+            self._cached_text_encoder = None
+        if self._cached_embeddings_processor is not None:
+            self._cached_embeddings_processor.to("meta")
+            self._cached_embeddings_processor = None
+        cleanup_memory()
 
 
 # ---------------------------------------------------------------------------

@@ -57,18 +57,41 @@ class DistilledPipeline:
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
+        persistent_text_encoder: bool = False,
+        text_encoder_device: torch.device | None = None,
+        persistent_transformer: bool = False,
     ):
+        """
+        ``persistent_text_encoder=True`` keeps the Gemma text encoder + embeddings
+        processor resident on ``text_encoder_device`` (default: same as ``device``)
+        across calls instead of rebuilding them every time -- worthwhile when
+        generating many prompts back to back. ``text_encoder_device`` lets that ~23GB
+        live on a second GPU, away from the transformer/VAEs on ``device``; if set to a
+        different device than ``device``, prompt-encoding outputs are moved onto
+        ``device`` before being handed to the diffusion stage.
+
+        ``persistent_transformer=True`` keeps the (much larger) distilled transformer
+        built once and resident on ``device`` instead of rebuilding it for every stage
+        of every call -- this pipeline reuses the same ``self.stage`` for both stage 1
+        and stage 2, so persistence eliminates both the per-video and the per-stage
+        rebuild. Not supported with ``offload_mode != OffloadMode.NONE``. Given the
+        transformer's bf16 footprint (~44GB) leaves little headroom for stage 2's
+        activation memory on a single GPU, strongly consider pairing this with an
+        fp8 ``quantization`` policy.
+        """
         self.device = device or get_device()
         self.dtype = torch.bfloat16
+        self._text_encoder_device = text_encoder_device or self.device
 
         self.prompt_encoder = PromptEncoder(
             distilled_checkpoint_path,
             gemma_root,
             self.dtype,
-            self.device,
+            self._text_encoder_device,
             registry=registry,
             offload_mode=offload_mode,
             alloc_trim_strategy=alloc_trim_strategy,
+            persistent=persistent_text_encoder,
         )
         self.image_conditioner = ImageConditioner(
             distilled_checkpoint_path,
@@ -87,6 +110,7 @@ class DistilledPipeline:
             compilation_config=compilation_config,
             offload_mode=offload_mode,
             alloc_trim_strategy=alloc_trim_strategy,
+            persistent=persistent_transformer,
         )
         self.upsampler = VideoUpsampler(
             distilled_checkpoint_path,
@@ -137,6 +161,11 @@ class DistilledPipeline:
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
         )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
+        if self._text_encoder_device != self.device:
+            # Prompt encoding ran on a separate device (e.g. a persistent text encoder
+            # pinned to its own GPU) -- move its outputs onto the diffusion stage's device.
+            video_context = video_context.to(self.device)
+            audio_context = audio_context.to(self.device) if audio_context is not None else None
 
         # Stage 1: Initial low resolution video generation.
         stage_1_sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
